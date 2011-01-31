@@ -1,0 +1,6 @@
+name = FOO
+description = Test module
+core = 7.x
+dependencies[] = themepacket
+
+files[] = foo.module

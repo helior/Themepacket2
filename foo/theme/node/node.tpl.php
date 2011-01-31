@@ -1,0 +1,1 @@
+<div>This is bad node</div>

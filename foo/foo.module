@@ -1,0 +1,25 @@
+<?php
+
+function foo_theme($existing, $type, $theme, $path) {
+  return themepacket($existing, $type, $theme, $path);
+}
+
+function foo_preprocess_page() {
+  // dpm(theme_get_registry());
+}
+
+function foo_menu() {
+  $items['foo'] = array(
+    'page callback' => 'foo_page',
+    'access callback' => TRUE,
+  );
+  
+  return $items;
+}
+
+function foo_page() {
+  $build['apple']['#markup'] = theme('foo_apple');
+  $build['apple2']['#markup'] = theme('foo_node');
+  
+  return $build;
+}

@@ -1,0 +1,468 @@
+<?php
+// $Id$
+
+/**
+ * @file
+ * Automatically discovers theme functions and templates found within
+ * the 'theme' folder of your modules/themes and automatically
+ * generates the array of theme hooks returned in your hook_theme().
+ *
+ * Also registers any assets found within the same directory as your
+ * theme implementation. And includes them when the theme is in the
+ * context of being rendered.
+ */
+
+/******************************************************************************
+ * API Functions
+ *****************************************************************************/
+
+/**
+ * Auto discover theme implementations.
+ * 
+ * @see hook_theme().
+ *  
+ * @param $existing
+ *  An array of existing implementations
+ * 
+ * @param $type
+ *  What "type" is being processed.
+ * 
+ * @param $theme
+ *  The actual name of theme that is being being checked.
+ * 
+ * @param $path
+ *  The directory path of the theme or module, so that it doesn't need to be
+ *  looked up.
+ * 
+ * @param $settings
+ *  An array in the format of hook_themepacket_info(). This array can override
+ *  the global themepacket interface for the scope of the currrent hook
+ *  implementation.
+ *  @see hook_themepacket_info().
+ * 
+ * @return
+ *  an array of theme implementations
+ * 
+ *  @see hook_theme().
+ */
+function themepacket($existing, $type, $theme, $path, $settings = array()) {
+  module_load_include('inc', 'themepacket', 'themepacket.module');
+  return _themepacket($existing, $type, $theme, $path, $settings);
+}
+
+/**
+ * Load Themepacket's programming interface and configurations.
+ * @see hook_themepacket_info().
+ */
+function themepacket_get_info() {
+  $interface = &drupal_static(__FUNCTION__);
+  
+  if (!$interface) {
+    $interface = module_invoke_all('themepacket_info');
+    
+    drupal_alter('themepacket_info', $interface);
+    
+    // Parse $interface array and generate helper properties
+    _themepacket_info_process($interface);
+  }
+  
+  return $interface;
+}
+
+
+/**
+ * Parses a filename and breaks apart its components into an object.
+ * 
+ * @param $filename
+ *   A string in the format of a filename.
+ * 
+ * @return
+ *  An object with properties parsed out from the filename:
+ *    - 'filename'
+ *       The original filename passed in.
+ *    - 'symbols'
+ *       An array of individual symbols parsed from the start of the string.
+ *    - 'prefixes'
+ *       An array of individual prefixes found before the hook.
+ *    - 'base'
+ *       The base name of the filename. Usually the intended name of the hook,
+ *       library, the asset name. (required).
+ *    - 'extension'
+ *       The extension used in this filename (required).
+ *  Will return NULL if filename is not in the proper format.
+ */
+function themepacket_parse_filename($filename = '') {
+  list($symbols, $extensions) = _themepacket_parse_filename_prepare();
+  $matches = array();
+  /**
+   * @todo the symbols capture is a bit harsh, since if it finds a symbol that
+   * was not registered it will completely fail the entire filename. This is
+   * very likely to happen if there are thempackets that use a symbol that was
+   * defined by a module that was later disabled.
+   */
+  $regex = '
+    /^
+      (?P<filename>                               # Capture the entire filename
+        (?P<symbols>[' . $symbols . ']+)?         # Capture the leading symbols (optional)
+        (?P<prefixes>(?:[\w\-]+\.)*)              # Capture prefixes (optional)
+        (?P<base>[\w\-]+)                         # Capture the base portion of the filename
+        \.(?P<extension>(?:' . $extensions . '))  # Capture the file extension
+      )
+    $/x';
+    
+  if (preg_match($regex, $filename, $matches)) {
+    
+    // Cleanup our matching array so we only return our named captures.
+    foreach (array_keys($matches) as $key) {
+      if (is_numeric($key)) {
+        unset($matches[$key]);
+      }
+    }
+    
+    // Since we're supporting multiple symbols we need to convert the string of
+    // matching symbols into an array, even if there is only one, or whatever.
+    $matches['symbols'] = strlen($matches['symbols']) ? str_split($matches['symbols']) : array();
+    
+    // We do the same thing as above with prefixes, only this time we have a
+    // delimiter to parse out.
+    $matches['prefixes'] = rtrim($matches['prefixes'], ".");
+    $matches['prefixes'] = strlen($matches['prefixes']) ? explode('.', $matches['prefixes']) : array();
+    
+    // Use keyed arrays instead of indexes to make array addition possible.
+    foreach (array('symbols', 'prefixes') as $key) {
+      foreach ($matches[$key] as $index => $value) {
+        $matches[$key][$value] = $value;
+        unset($matches[$key][$index]);
+      }
+    }
+  }
+  
+  // If the filename we tried to bisect didn't match the regular expression,
+  // we'll just log a message and return NULL.
+  else {
+    watchdog('themepacket',
+      'Bad filename: %filename did not pass the required format for %function(). Check out !link for documentation',
+      array('%filename' => $filename, '%function' => __FUNCTION__, '!link' => '<a href="http://api.activelamp.com/d7/themepacket">Themepacket API</a>'),
+      WATCHDOG_ERROR);
+    $matches = NULL;
+  }
+
+  return (array)$matches;
+}
+
+
+/******************************************************************************
+ * Drupal Hooks
+ *****************************************************************************/
+
+// function themepacket_init() {
+  // $info = themepacket_get_info();
+  // $dir = drupal_get_path('module', 'foo') . '/theme';
+  // $mask = '/\S+\.(' . implode('|', $info['helpers']['markup_types']) . ')$/';
+  // 
+  // /* @todo provide opportunity to add configurable regex for 'nomask' @see file_scan_directory() */
+  // $options = array();
+  // 
+  // $files = file_scan_directory($dir, $mask, $options);
+  // // 
+  // module_load_include('inc', 'themepacket', 'themepacket.module');
+  // _themepacket_process_filenames($files);
+  // dpm($files);
+  // dpm(themepacket_get_info(), 'info');
+// }
+
+function themepacket_exit() {
+  drupal_theme_rebuild();
+}
+
+/******************************************************************************
+ * Contrib Hooks
+ *****************************************************************************/
+
+/**
+ * Implements hook_themepacket_info().
+ */
+function themepacket_themepacket_info() {
+  $symbol_ignore = array(
+    '_' => array(
+      'name' => t('Ignore'),
+      'description' => t('Makes a file be ignored by Themepacket'),
+      'callback' => '_themepacket_ignore_callback',
+    ),
+  );
+  
+  return array(
+    'extensions' => array(
+      'tpl.php' => array(
+        'type' => 'template',
+        'symbols' => $symbol_ignore,
+        'callback' => '_themepacket_process_phptemplates',
+      ),
+      'inc' => array(
+        'type' => 'include',
+        'symbols' => $symbol_ignore,
+        'callback' => '_themepacket_process_includes',
+      ),
+      'css' => array(
+        'type' => 'asset',
+        'symbols' => $symbol_ignore,
+        'callback' => '_themepacket_process_css',
+      ),
+      'js' => array(
+        'type' => 'asset',
+        'symbols' => $symbol_ignore,
+        'callback' => '_themepacket_process_js',
+      ),
+      'library' => array(
+        'type' => 'asset',
+        'symbols' => $symbol_ignore,
+        'callback' => '_themepacket_process_library'
+      ),
+    ),
+    'settings' => array(
+      'theme path' => 'theme',
+      'ignore paths' => array(),
+    ),
+  );
+}
+
+
+/**
+ * Helper function to create simplified results of the interface in a 'helper'
+ * key.
+ */
+function _themepacket_info_process(&$interface) {
+  
+  // This group helps identify extension types that ultimately produce markup
+  // or contain php logic, or are external files that compliment the markup,
+  // such as styles or scripts.
+  $groups = array(
+    'asset' => array('asset'),
+    'markup' => array('template', 'include'),
+  );
+  
+  foreach ($interface['extensions'] as $ext => $info) {
+    
+    // Create helpers for asset types and markup types.
+    foreach ($groups as $kind => $types_supported) {
+      if (in_array($info['type'], $types_supported)) {
+        $interface['helpers']['all_types'][] = $ext;
+        $interface['helpers'][$kind . '_types'][] = $ext;
+      }
+    }
+    
+    // Create helpers for all registered symbols.
+    foreach (array_keys($info['symbols']) as $symbol) {
+      $interface['helpers']['all_symbols'][$symbol] = $symbol;
+    }
+    
+  }
+}
+
+
+
+function _themepacket_parse_filename_prepare() {
+  $info = themepacket_get_info();
+  
+  // Prepend escape character to each symbol so regex can capture it as a
+  // literal in case of special characters.
+  foreach ($info['helpers']['all_symbols'] as $symbol) {
+    $symbols[] = '\\' . $symbol;
+  }
+  
+  $symbols = implode('', $symbols);
+  $extensions = implode('|', $info['helpers']['all_types']);
+  
+  return array($symbols, $extensions);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/**
+ * Wrapper function to find theme hook patterns while also enabling
+ * asset registration.
+ * 
+ * @param $hooks
+ *  A copy of the current theme registry
+ * 
+ * @param $extension
+ *  The file extension of the patterns. This will almost always be
+ *  '.tpl.php'.
+ * 
+ * @param $path
+ *  The path to the current hook_theme implementation.
+ * 
+ * @return
+ *  An array of fully-built theme hooks of matching patterns found.
+ */
+function themepacket_find_patterns($hooks = NULL, $extension = '.tpl.php', $path = '') {
+  if (!empty($hooks)  && !empty($path)) {
+    $patterns = drupal_find_theme_templates($hooks, $extension, $path);
+    foreach ($patterns as $name => $info) {
+      $patterns[$name]['include assets'] = TRUE;
+    }
+    return $patterns;
+  }
+}
+
+
+/**
+ * Custom preprocessor used by both templates and theme functions.
+ */
+function _themepacket_preprocess(&$vars, $hook) {
+  global $theme;
+  $assets = assets_get_registry();
+  if (!empty($assets->data) && isset($assets->data[$hook])) {
+    
+    $item = $assets->data[$hook];
+    if (!empty($item['js'])) {
+      foreach ($item['js'] as $js) {
+        $options = array();
+        if (isset($js->alias)) { $options['weight'] = -1; }
+        drupal_add_js($js->uri, $options);
+      }
+    }
+    
+    if (!empty($item['css'])) {
+      foreach ($item['css'] as $css) {
+        drupal_add_css($css->uri);
+      }
+    }
+    
+  }
+}
+
+
+/**
+ * Scan a directory to discover css and javascript files.
+ * 
+ * @param $path
+ *   The path that will be scanned.
+ * 
+ * @return
+ *   An array of assets found.
+ */
+function themepacket_discover_assets($path = '') {
+  if (!empty($path)) {
+    $assets = array('js' => array(), 'css' => array());
+    $files = file_scan_directory($path, '/[0-9A-Za-z.\-_]+(.js|.css)$/');
+    foreach ($files as $file) {
+      //seperate js and css files
+      $extensions = array('js', 'css');
+      foreach ($extensions as $ext) {
+        if (preg_match('/.' . $ext . '$/', $file->uri)) {
+          
+          /**
+           * Symbolic links are added to the beginning of
+           * the array since they are usually dependencies.
+           * @fixme multiple symlink files are added to the array in
+           * the reverse order that the filesystem stores its files.
+           */
+          if (_themepacket_symlink_info($file)) {
+            array_unshift($assets[$ext], $file);
+          }
+          elseif ($file) {
+            $assets[$ext][] = $file;
+          }
+        }
+      }
+    }
+   return $assets; 
+  }
+}
+
+
+/**
+ * Builds a single asset registry component.
+ * 
+ * @param $info
+ *   An array of information from a theme hook.
+ * 
+ * @param $options
+ *   An array of extra parameters
+ *   - "type": The type of asset registry component.
+ * 
+ * @return An array representation of fully built asset registry component.
+ */
+function _themepacket_build_assets($info, $options = array()) {
+  $assets = array();
+  
+  // Build basic info
+  $assets['base path'] = $info['path'];
+  $assets['type'] = (isset($options['type'])) ? $options['type'] : 'discovered';
+  
+  // Build asset files
+  $files = themepacket_discover_assets($info['path']);
+  $assets['js'] = $files['js'];
+  $assets['css'] = $files['css'];
+  
+  return $assets;
+}
+
+
+/**
+ * Determines if file is a symbolic link. If symbolic link, the file
+ * object is modified to contain reference to the original file and
+ * also track the location of the alias.
+ * 
+ * @see file_scan_directory().
+ * 
+ * @param $file
+ *   A file object.
+ * 
+ * @return
+ *   Returns false if file is not a symbolic link. returns true
+ *   if symbolic link target exists, otherwise the file object is
+ *   destroyed.
+ */
+function _themepacket_symlink_info(&$file = NULL) {
+  if ($file) {
+    if (isset($file->uri) && !is_link($file->uri)) {
+      return;
+    }
+
+    // Parse out original filename from symlink content and send it to asset registry.
+    $orig = variable_get('themepacket_library_path', 'sites/all/libraries') .'/'. end(explode('/', readlink($file->uri)));
+    
+    if (file_exists($orig)) {
+      $file->alias = $file->uri;
+      $file->uri = $orig;
+      return TRUE;
+    }
+    else {
+      // Original file does not exist, prevent it from trying to add itself to the asset registry.
+      drupal_set_message(t('Alias @alias references the file @orig which does not exist.', array('@alias' => $file->filename, '@orig' => $orig)), 'warning');
+      $file = NULL;
+    }
+  }
+}
+
+
+/**
+ * Retrive the assets registry and store it in static variable.
+ */
+function assets_get_registry($theme = NULL) {
+  if (empty($theme)) {
+    global $theme;
+  }
+  
+  static $assets;
+  $assets = NULL;
+  if (!isset($assets)) {
+    $assets = cache_get('asset_registry:'. $theme);
+  }
+  return $assets;
+}
